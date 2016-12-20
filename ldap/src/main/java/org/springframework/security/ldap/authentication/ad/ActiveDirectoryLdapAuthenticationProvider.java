@@ -36,11 +36,15 @@ import org.springframework.util.Assert;
 import org.springframework.util.StringUtils;
 
 import javax.naming.AuthenticationException;
+import javax.naming.CompositeName;
 import javax.naming.Context;
+import javax.naming.NamingEnumeration;
 import javax.naming.NamingException;
 import javax.naming.OperationNotSupportedException;
+import javax.naming.PartialResultException;
 import javax.naming.directory.DirContext;
 import javax.naming.directory.SearchControls;
+import javax.naming.directory.SearchResult;
 import javax.naming.ldap.InitialLdapContext;
 import java.util.*;
 import java.util.regex.Matcher;
@@ -104,6 +108,9 @@ public final class ActiveDirectoryLdapAuthenticationProvider extends
 
 	private final String domain;
 	private final String rootDn;
+	private final boolean recusiveGroupMembership;
+    private final String groupRootDn;
+    private final int groupSearchControl;
 	private final String url;
 	private boolean convertSubErrorCodesToExceptions;
 	private String searchFilter = "(&(objectClass=user)(userPrincipalName={0}))";
@@ -111,6 +118,21 @@ public final class ActiveDirectoryLdapAuthenticationProvider extends
 	// Only used to allow tests to substitute a mock LdapContext
 	ContextFactory contextFactory = new ContextFactory();
 
+    /**
+     * @param domain the domain name (may be null or empty)
+     * @param url an LDAP url (or multiple URLs)
+     * @param rootDn the root DN (may be null or empty)
+     */
+    public ActiveDirectoryLdapAuthenticationProvider(String domain, String url,
+            String rootDn, String groupRootDn, int groupSearchControl) {
+        Assert.isTrue(StringUtils.hasText(url), "Url cannot be empty");
+        this.domain = StringUtils.hasText(domain) ? domain.toLowerCase() : null;
+        this.url = url;
+        this.rootDn = StringUtils.hasText(rootDn) ? rootDn.toLowerCase() : null;
+        this.recusiveGroupMembership = true;
+        this.groupRootDn = groupRootDn;
+        this.groupSearchControl = groupSearchControl;
+    }
 	/**
 	 * @param domain the domain name (may be null or empty)
 	 * @param url an LDAP url (or multiple URLs)
@@ -122,6 +144,9 @@ public final class ActiveDirectoryLdapAuthenticationProvider extends
 		this.domain = StringUtils.hasText(domain) ? domain.toLowerCase() : null;
 		this.url = url;
 		this.rootDn = StringUtils.hasText(rootDn) ? rootDn.toLowerCase() : null;
+		this.recusiveGroupMembership = false;
+        this.groupRootDn = null;
+        this.groupSearchControl = SearchControls.SUBTREE_SCOPE;
 	}
 
 	/**
@@ -133,6 +158,9 @@ public final class ActiveDirectoryLdapAuthenticationProvider extends
 		this.domain = StringUtils.hasText(domain) ? domain.toLowerCase() : null;
 		this.url = url;
 		rootDn = this.domain == null ? null : rootDnFromDomain(this.domain);
+        this.recusiveGroupMembership = false;
+        this.groupRootDn = null;
+        this.groupSearchControl = SearchControls.SUBTREE_SCOPE;
 	}
 
 	@Override
@@ -156,34 +184,101 @@ public final class ActiveDirectoryLdapAuthenticationProvider extends
 		}
 	}
 
+    @Override
+    protected Collection< ? extends GrantedAuthority> loadUserAuthorities(DirContextOperations userData, String username, String password) {
+        if (this.recusiveGroupMembership) {
+            try {
+                return recursiveLoadUserAuthorities(userData, username, password);
+            } catch (NamingException e) {
+                return AuthorityUtils.NO_AUTHORITIES;
+            }
+        } else {
+            return simpleLoadUserAuthorities(userData, username, password);
+        }
+    }
+
+    /**
+     * Creates the user authority list from the values of the {@code memberOf} attribute
+     * obtained from the user's Active Directory entry.
+     */
+    protected Collection<? extends GrantedAuthority> simpleLoadUserAuthorities(
+            DirContextOperations userData, String username, String password) {
+        String[] groups = userData.getStringAttributes("memberOf");
+
+        if (groups == null) {
+            logger.debug("No values for 'memberOf' attribute.");
+
+            return AuthorityUtils.NO_AUTHORITIES;
+        }
+
+        if (logger.isDebugEnabled()) {
+            logger.debug("'memberOf' attribute values: " + Arrays.asList(groups));
+        }
+
+        ArrayList<GrantedAuthority> authorities = new ArrayList<GrantedAuthority>(
+                groups.length);
+
+        for (String group : groups) {
+            authorities.add(new SimpleGrantedAuthority(new DistinguishedName(group)
+                    .removeLast().getValue()));
+        }
+
+        return authorities;
+    }
+
 	/**
 	 * Creates the user authority list from the values of the {@code memberOf} attribute
-	 * obtained from the user's Active Directory entry.
+	 * obtained from the recursive group query in Active Directory.
+	 * @throws NamingException 
 	 */
-	@Override
-	protected Collection<? extends GrantedAuthority> loadUserAuthorities(
-			DirContextOperations userData, String username, String password) {
-		String[] groups = userData.getStringAttributes("memberOf");
+	protected Collection<? extends GrantedAuthority> recursiveLoadUserAuthorities(
+			DirContextOperations userData, String username, String password) throws NamingException {
+	    
+        ArrayList<GrantedAuthority> authorities = new ArrayList<GrantedAuthority>();
+    
+	    SearchControls searchControls = new SearchControls();
+	    searchControls.setSearchScope(groupSearchControl);
 
-		if (groups == null) {
-			logger.debug("No values for 'memberOf' attribute.");
+	    String filter = "(&(objectClass=group)(member:1.2.840.113556.1.4.1941:={0}))";
 
-			return AuthorityUtils.NO_AUTHORITIES;
-		}
+	    final String bindPrincipal = createBindPrincipal(username);
+	    
+	    // Try using groupRootDn if not use rootDn is not search from principal
+	    String searchRoot = groupRootDn != null ? groupRootDn : (rootDn != null ? rootDn : searchRootFromPrincipal(bindPrincipal));
+	    
+	    DirContext ctx = bindAsUser(username, password);
+	    final DistinguishedName ctxBaseDn = new DistinguishedName(ctx.getNameInNamespace());
+	    final DistinguishedName searchBaseDn = new DistinguishedName(searchRoot);
 
-		if (logger.isDebugEnabled()) {
-			logger.debug("'memberOf' attribute values: " + Arrays.asList(groups));
-		}
+	    final NamingEnumeration<SearchResult> resultsEnum = ctx.search(searchBaseDn, filter, new Object[]{userData.getDn()}, searchControls);
 
-		ArrayList<GrantedAuthority> authorities = new ArrayList<GrantedAuthority>(
-				groups.length);
+	    if (logger.isDebugEnabled()) {
+	        logger.debug("Searching for entry under DN '" + ctxBaseDn + "', base = '" + searchBaseDn + "', filter = '" + filter + "'");
+	    }
 
-		for (String group : groups) {
-			authorities.add(new SimpleGrantedAuthority(new DistinguishedName(group)
-					.removeLast().getValue()));
-		}
+	    try {
+	        while (resultsEnum.hasMore()) {
+	            SearchResult searchResult = resultsEnum.next();
+	            // Work out the DN of the matched entry
+	            DistinguishedName dn = new DistinguishedName(new CompositeName(searchResult.getName()));
 
-		return authorities;
+	            if (searchRoot.length() > 0) {
+	                dn.prepend(searchBaseDn);
+	            }
+
+	            if (logger.isDebugEnabled()) {
+	                logger.debug("Found DN: " + dn);
+	            }
+
+	            authorities.add(new SimpleGrantedAuthority(dn.removeLast().getValue()));
+	        }
+	    } catch (PartialResultException e) {
+	        org.springframework.security.ldap.LdapUtils.closeEnumeration(resultsEnum);
+	        logger.info("Ignoring PartialResultException");
+    	    }
+ 
+
+	    return authorities;
 	}
 
 	private DirContext bindAsUser(String username, String password) {
